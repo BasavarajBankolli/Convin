@@ -7,8 +7,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// execer is satisfied by both *pgxpool.Pool and pgx.Tx so statement helpers
+// can run standalone or inside a transaction.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 // Event is one call-completion webhook delivery.
 type Event struct {
@@ -58,6 +65,41 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
 
+// IngestEvent records a delivery and its side effects in one transaction.
+// The INSERT itself is the deduplication gate: with the unique index on
+// events.event_id, a redelivery conflicts and affects zero rows, so nothing
+// is written and nothing is counted. It reports whether event_id was new.
+func (s *Store) IngestEvent(ctx context.Context, e Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	if err := upsertCall(ctx, tx, e); err != nil {
+		return false, err
+	}
+	if err := incrementAccountStats(ctx, tx, e.AccountID, e.DurationSec); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // EventExists reports whether an event with this ID has already been stored.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
@@ -83,7 +125,11 @@ func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 
 // UpsertCall creates or refreshes the call record for this event.
 func (s *Store) UpsertCall(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+	return upsertCall(ctx, s.pool, e)
+}
+
+func upsertCall(ctx context.Context, q execer, e Event) error {
+	_, err := q.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
 		 ON CONFLICT (call_id) DO UPDATE SET
@@ -105,7 +151,11 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 
 // IncrementAccountStats folds one completed call into the durable aggregate.
 func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
-	_, err := s.pool.Exec(ctx,
+	return incrementAccountStats(ctx, s.pool, accountID, durationSec)
+}
+
+func incrementAccountStats(ctx context.Context, q execer, accountID string, durationSec int) error {
+	_, err := q.Exec(ctx,
 		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
 		 VALUES ($1, 1, $2)
 		 ON CONFLICT (account_id) DO UPDATE SET

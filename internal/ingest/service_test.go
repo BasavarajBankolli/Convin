@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -109,5 +110,52 @@ func TestRecordingGetsMarkedProcessed(t *testing.T) {
 			t.Fatal("recording was never marked processed")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestConcurrentDuplicateDeliveryCountsOnce(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const deliveries = 20
+	var wg sync.WaitGroup
+	for i := 0; i < deliveries; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(srv.URL+"/webhooks/calls", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Errorf("delivery: %v", err)
+				return
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("delivery got %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var events, statsCount int64
+	row := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	row = st.Pool().QueryRow(ctx, `SELECT call_count FROM account_stats WHERE account_id = $1`, accountID)
+	if err := row.Scan(&statsCount); err != nil {
+		t.Fatalf("count stats: %v", err)
+	}
+
+	var calls int64
+	row = st.Pool().QueryRow(ctx, `SELECT count(*) FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&calls); err != nil {
+		t.Fatalf("count calls: %v", err)
+	}
+
+	if events != 1 || statsCount != 1 || calls != 1 {
+		t.Fatalf("got events=%d stats=%d calls=%d, want 1/1/1 (concurrent redelivery double-counted)", events, statsCount, calls)
 	}
 }
