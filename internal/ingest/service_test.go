@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -80,5 +81,33 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+func TestRecordingGetsMarkedProcessed(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var processed bool
+		row := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+		if err := row.Scan(&processed); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if processed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recording was never marked processed")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
