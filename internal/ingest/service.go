@@ -69,7 +69,7 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(context.Background(), rec); err != nil {
+			if err := s.processRecording(context.Background(), rec.CallID); err != nil {
 				s.log.Error("recording processing failed", "call_id", rec.CallID, "err", err)
 			}
 		}()
@@ -78,9 +78,51 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	return nil
 }
 
+// HydrateFromStore rebuilds the in-memory cache from the durable
+// aggregates so a freshly deployed process serves correct numbers
+// immediately instead of starting from zero.
+func (s *Service) HydrateFromStore(ctx context.Context) error {
+	durable, err := s.store.AllAccountStats(ctx)
+	if err != nil {
+		return err
+	}
+	for accountID, st := range durable {
+		s.cache.Put(accountID, stats.AccountStats{
+			CallCount:        st.CallCount,
+			TotalDurationSec: st.TotalDurationSec,
+		})
+	}
+	return nil
+}
+
+// ReplayPendingRecordings resumes recording processing for calls left
+// unprocessed by an earlier process, so work in flight at deploy time is
+// not lost. Marking is idempotent, so overlapping replays are safe.
+func (s *Service) ReplayPendingRecordings(ctx context.Context) error {
+	pending, err := s.store.PendingRecordings(ctx)
+	if err != nil {
+		return err
+	}
+	for _, callID := range pending {
+		if err := s.processRecording(ctx, callID); err != nil {
+			s.log.Error("recording replay failed", "call_id", callID, "err", err)
+		}
+	}
+	return nil
+}
+
+// Restore is the startup sequence after a deploy: hydrate the cache from
+// the durable copy, then resume unfinished recording work.
+func (s *Service) Restore(ctx context.Context) error {
+	if err := s.HydrateFromStore(ctx); err != nil {
+		return err
+	}
+	return s.ReplayPendingRecordings(ctx)
+}
+
 // processRecording downloads and transcodes the call recording, then marks
 // the call as done.
-func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
+func (s *Service) processRecording(ctx context.Context, callID string) error {
 	time.Sleep(recordingWork)
-	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+	return s.store.MarkRecordingProcessed(ctx, callID)
 }

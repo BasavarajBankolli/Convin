@@ -35,6 +35,15 @@ func (c *Cache) Get(accountID string) AccountStats {
 	return *s
 }
 
+// Put overwrites an account's totals with a snapshot. It is used to
+// hydrate the cache from the durable copy when a fresh process starts.
+func (c *Cache) Put(accountID string, s AccountStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m[accountID] = &s
+}
+
 // Record folds one completed call into an account's running totals.
 func (c *Cache) Record(accountID string, durationSec int) {
 	c.mu.Lock()

@@ -179,3 +179,47 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 	}
 	return st, nil
 }
+
+// AllAccountStats returns the durable aggregate for every account, used to
+// rebuild the in-memory cache when a fresh process starts.
+func (s *Store) AllAccountStats(ctx context.Context) (map[string]Stats, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT account_id, call_count, total_duration_sec FROM account_stats`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]Stats)
+	for rows.Next() {
+		var accountID string
+		var st Stats
+		if err := rows.Scan(&accountID, &st.CallCount, &st.TotalDurationSec); err != nil {
+			return nil, err
+		}
+		out[accountID] = st
+	}
+	return out, rows.Err()
+}
+
+// PendingRecordings lists calls whose recording still needs processing, so
+// work left in flight by an earlier process can be resumed at startup.
+func (s *Store) PendingRecordings(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT call_id FROM calls
+		 WHERE recording_url IS NOT NULL AND recording_processed = FALSE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var calls []string
+	for rows.Next() {
+		var callID string
+		if err := rows.Scan(&callID); err != nil {
+			return nil, err
+		}
+		calls = append(calls, callID)
+	}
+	return calls, rows.Err()
+}
